@@ -1,19 +1,28 @@
 package com.sanitysaver;
 
 import com.google.inject.Provides;
-import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.Client;
+import net.runelite.api.Menu;
 import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.PostItemComposition;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.api.ItemComposition;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.util.AsyncBufferedImage;
+
+
+import javax.inject.Inject;
 
 import java.awt.*;
+import java.awt.image.BufferedImage;
 
 @Slf4j
 @PluginDescriptor(
@@ -21,9 +30,14 @@ import java.awt.*;
 )
 public class SanitySaverPlugin extends Plugin
 {
-
 	@Inject
 	private Client client;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private ClientThread clientThread;
 
 	@Inject
 	private SanitySaverConfig config;
@@ -40,15 +54,17 @@ public class SanitySaverPlugin extends Plugin
 	@Override
 	protected void startUp() throws Exception
 	{
+        itemOverlay.clearCache();
+        resetCaches();
         overlayManager.add(itemOverlay);
-		log.debug("Sanity Saver started!");
 	}
 
 	@Override
 	protected void shutDown() throws Exception
 	{
+        itemOverlay.clearCache();
+        resetCaches();
         overlayManager.remove(itemOverlay);
-		log.debug("Sanity Saver stopped!");
 	}
 
 	@Provides
@@ -57,20 +73,60 @@ public class SanitySaverPlugin extends Plugin
 		return configManager.getConfig(SanitySaverConfig.class);
 	}
 
+    //Ref unidentified-herbs by hex-agon and MoreFillPlugin by UnExploration
     @Subscribe
-    public void onMenuEntryAdded(MenuEntryAdded event)
+    public void onPostItemComposition(PostItemComposition event)
     {
-        if (!event.getOption().equalsIgnoreCase("Examine"))
+        ItemComposition itemComposition = event.getItemComposition();
+        int itemId = itemComposition.getId();
+
+        if (!isItemCensored(itemId))
         {
             return;
         }
 
+        if (itemOverlay.isCached(itemId))
+        {
+            itemComposition.setInventoryModel(-1);
+            return;
+        }
+
+        AsyncBufferedImage image = itemManager.getImage(itemId);
+
+        image.onLoaded(() ->
+        {
+            BufferedImage buffered = image.getSubimage(0, 0, image.getWidth(), image.getHeight());
+            itemOverlay.cacheSprite(itemId, buffered);
+
+            itemComposition.setInventoryModel(-1);
+            resetCaches();
+        });
+    }
+
+    //Ref unidentified-herbs by hex-agon and MoreFillPlugin by UnExploration
+    private void resetCaches() {
+        clientThread.invokeLater(() -> {
+            client.getItemCompositionCache().reset();
+            client.getItemModelCache().reset();
+            client.getItemSpriteCache().reset();
+        });
+    }
+
+    @Subscribe
+    public void onMenuEntryAdded(MenuEntryAdded event)
+    {
         if (!client.isKeyPressed(KeyCode.KC_SHIFT))
         {
             return;
         }
 
+        if (!event.getOption().equalsIgnoreCase("Examine"))
+        {
+            return;
+        }
+
         Widget widget = event.getMenuEntry().getWidget();
+
         if (widget == null || widget.getItemId() <= 0)
         {
             return;
@@ -82,11 +138,13 @@ public class SanitySaverPlugin extends Plugin
 
         String option = censored ? "Uncensor" : "Censor";
 
-        client.createMenuEntry(-1)
-                .setOption(option)
+        Menu menu = client.getMenu();
+        MenuEntry entry = menu.createMenuEntry(-1); // -1 to append at the end
+        entry.setOption(option)
                 .setTarget(event.getTarget())
                 .setType(MenuAction.RUNELITE)
                 .onClick(e -> toggleItemCensor(itemId));
+
     }
 
     private boolean isItemCensored(int itemId)
@@ -97,9 +155,9 @@ public class SanitySaverPlugin extends Plugin
             return false;
         }
 
-        for (String token : list.split(","))
+        for (String censoredID : list.split(","))
         {
-            if (token.trim().equals(String.valueOf(itemId)))
+            if (censoredID.trim().equals(String.valueOf(itemId)))
             {
                 return true;
             }
@@ -113,47 +171,50 @@ public class SanitySaverPlugin extends Plugin
         String id = String.valueOf(itemId);
         String current = config.censoredItems();
 
-        StringBuilder result = new StringBuilder();
+        StringBuilder censoredIDList = new StringBuilder();
 
         boolean removed = false;
 
         if (current != null && !current.isBlank())
         {
-            for (String token : current.split(","))
+            for (String censoredID : current.split(","))
             {
-                token = token.trim();
-                if (token.isEmpty())
+                censoredID = censoredID.trim();
+                if (censoredID.isEmpty())
                 {
                     continue;
                 }
 
-                if (token.equals(id))
+                if (censoredID.equals(id))
                 {
                     removed = true;
+                    itemOverlay.removeSprite(itemId);
                     continue;
                 }
 
-                if (result.length() > 0)
+                if (censoredIDList.length() > 0)
                 {
-                    result.append(", ");
+                    censoredIDList.append(", ");
                 }
-                result.append(token);
+                censoredIDList.append(censoredID);
             }
         }
 
         if (!removed)
         {
-            if (result.length() > 0)
+            if (censoredIDList.length() > 0)
             {
-                result.append(", ");
+                censoredIDList.append(", ");
             }
-            result.append(id);
+            censoredIDList.append(id);
         }
 
         configManager.setConfiguration(
                 "sanitysaver",
                 "censoredItems",
-                result.toString()
+                censoredIDList.toString()
         );
+
+        resetCaches();
     }
 }
